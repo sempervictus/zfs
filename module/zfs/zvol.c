@@ -88,6 +88,7 @@
 #include <sys/zfs_znode.h>
 #include <sys/spa_impl.h>
 #include <sys/zvol.h>
+#include <sys/kstat.h>
 #include <linux/blkdev_compat.h>
 
 unsigned int zvol_inhibit_dev = 0;
@@ -102,6 +103,10 @@ static taskq_t *zvol_taskq;
 static kmutex_t zvol_state_lock;
 static list_t zvol_state_list;
 
+static char *pds_volume_sig = "flexvisor:volsig";
+static char *pds_preferred_sz_name = "flexvisor:preferred_sector_size";
+static int pds_preferred_sector_size_defined = 0;
+ 
 #define	ZVOL_HT_SIZE	1024
 static struct hlist_head *zvol_htable;
 #define	ZVOL_HT_HEAD(hash)	(&zvol_htable[(hash) & (ZVOL_HT_SIZE-1)])
@@ -283,12 +288,16 @@ zvol_create_cb(objset_t *os, void *arg, cred_t *cr, dmu_tx_t *tx)
 	nvlist_t *nvprops = zct->zct_props;
 	int error;
 	uint64_t volblocksize, volsize;
+	char *preferred_sz_buf;
 
 	VERIFY(nvlist_lookup_uint64(nvprops,
 	    zfs_prop_to_name(ZFS_PROP_VOLSIZE), &volsize) == 0);
 	if (nvlist_lookup_uint64(nvprops,
 	    zfs_prop_to_name(ZFS_PROP_VOLBLOCKSIZE), &volblocksize) != 0)
 		volblocksize = zfs_prop_default_numeric(ZFS_PROP_VOLBLOCKSIZE);
+	if (nvlist_lookup_string(nvprops,
+	    pds_preferred_sz_name, &preferred_sz_buf) == 0)
+		pds_preferred_sector_size_defined = 1;
 
 	/*
 	 * These properties must be removed from the list so the generic
@@ -1475,6 +1484,10 @@ zvol_ioctl(struct block_device *bdev, fmode_t mode,
 
 		rw_exit(&zv->zv_suspend_lock);
 		break;
+	case BLKZMODPUT:
+		module_put(THIS_MODULE);
+		/* printk(KERN_INFO "ZFS: decrease module count\n"); */
+		break;
 
 	case BLKZNAME:
 		mutex_enter(&zv->zv_state_lock);
@@ -1745,6 +1758,42 @@ zvol_free(void *arg)
 	kmem_free(zv, sizeof (zvol_state_t));
 }
 
+static int
+__string_to_integer(const char *name, char *str)
+{
+	static int valid_sz[] = { 512, 1024, 2048, 4096, 16384, 32768, 65536, 131072 };
+	int s, r = 0;
+	int i;
+
+	s = strlen(str);
+	if (str[0] == '0' && s == 1) {
+		return 0;
+	}
+	else if (!strncmp(str, "512", 3) && (s == 3 || str[3] == 'b' || str[3] == 'B')) {
+		r = 512;
+	}
+	else if (str[s - 1] == 'k' || str[s - 1] == 'K') {
+		for (i = 0; i < s - 1; i++) {
+			if (str[i] >= '0' && str[i] <= '9')
+				r = (r * 10) + (int)(str[i] - '0');
+			else
+				break;
+		}
+		r *= 1024;
+	}
+	if (r > 0) {
+		for (i = 0; i < sizeof(valid_sz); i++) {
+			if (r == valid_sz[i])
+				break;
+		}
+		if (i >= sizeof(valid_sz))
+			r = 0;
+	}
+	if (r == 0)
+		printk(KERN_INFO "ZFS: %s invalid preferred sector size: %s\n", name, str);
+	return r;
+}
+
 /*
  * Create a block device minor node and setup the linkage between it
  * and the specified volume.  Once this function returns the block
@@ -1762,7 +1811,11 @@ zvol_create_minor_impl(const char *name)
 	int error = 0;
 	int idx;
 	uint64_t hash = zvol_name_hash(name);
-
+	char volume_sig_buf[36];
+	char preferred_sz_buf[16];
+	uint64_t preferred_sector_size = 0;
+	int i;
+ 
 	if (zvol_inhibit_dev)
 		return (0);
 
@@ -1789,6 +1842,29 @@ zvol_create_minor_impl(const char *name)
 	if (error)
 		goto out_dmu_objset_disown;
 
+	if (pds_preferred_sector_size_defined) {
+		for (i = 0; i < 300; i++) {
+			error = dsl_prop_get(name, pds_volume_sig, 1, 36, volume_sig_buf, NULL);
+			if (error == 0) {
+				break;
+			}
+			schedule_timeout_interruptible(HZ/10);
+		}
+	}
+	for (i = 0; i < 10; i++) {
+		error = dsl_prop_get(name, pds_preferred_sz_name, 1, 16, preferred_sz_buf, NULL);
+		if (error == 0) {
+			preferred_sector_size = __string_to_integer(name, preferred_sz_buf);
+			pds_preferred_sector_size_defined = 1;
+			break;
+		}
+		if (pds_preferred_sector_size_defined == 0)
+			break;
+		schedule_timeout_interruptible(HZ/10);
+	}
+	if (preferred_sector_size == 0)
+		preferred_sector_size = doi->doi_data_block_size;
+
 	error = zap_lookup(os, ZVOL_ZAP_OBJ, "size", 8, 1, &volsize);
 	if (error)
 		goto out_dmu_objset_disown;
@@ -1812,7 +1888,9 @@ zvol_create_minor_impl(const char *name)
 	blk_queue_max_hw_sectors(zv->zv_queue, (DMU_MAX_ACCESS / 4) >> 9);
 	blk_queue_max_segments(zv->zv_queue, UINT16_MAX);
 	blk_queue_max_segment_size(zv->zv_queue, UINT_MAX);
-	blk_queue_physical_block_size(zv->zv_queue, zv->zv_volblocksize);
+	blk_queue_physical_block_size(zv->zv_queue, preferred_sector_size);
+	if (preferred_sector_size != zv->zv_volblocksize)
+		printk(KERN_INFO "ZFS: set %s preferred sector size to %llu\n", name, preferred_sector_size);
 	blk_queue_io_opt(zv->zv_queue, zv->zv_volblocksize);
 	blk_queue_max_discard_sectors(zv->zv_queue,
 	    (zvol_max_discard_blocks * zv->zv_volblocksize) >> 9);
@@ -2227,6 +2305,12 @@ zvol_rename_minors_impl(const char *oldname, const char *newname)
 	if (zvol_inhibit_dev)
 		return;
 
+	if (strchr(oldname, '@') != NULL && strchr(newname, '@') != NULL) {
+		/* printk(KERN_NOTICE "zfs rename snapshot from %s to %s\n",
+				oldname, newname); */
+		return;
+	}
+
 	oldnamelen = strlen(oldname);
 	newnamelen = strlen(newname);
 
@@ -2627,6 +2711,92 @@ zvol_rename_minors(spa_t *spa, const char *name1, const char *name2,
 		taskq_wait_id(spa->spa_zvol_taskq, id);
 }
 
+static kmutex_t zfs_zvols_lock;
+kstat_t *zfs_zvols_kstat;
+static int zfs_zvols_paging = 0;
+
+static int
+zfs_zvols_headers(char *buf, size_t size)
+{
+	return (0);
+}
+
+static int
+zfs_zvols_data(char *buf, size_t size, void *data)
+{
+	zvol_state_t *zv;
+	char entry[256];
+	int off = 0, len;
+	int paging = 0;
+	int rc = 0;
+
+	mutex_enter(&zvol_state_lock);
+	for (zv = list_head(&zvol_state_list); zv != NULL;
+	    zv = list_next(&zvol_state_list, zv)) {
+		if (paging++ < zfs_zvols_paging)
+			continue;
+		len = snprintf(entry, 256, "%d:%d\t%s\n", MAJOR(zv->zv_dev), MINOR(zv->zv_dev), zv->zv_name);
+		if (len <= 0 || len >= 256) {
+			rc = ENXIO;
+			break;
+		}
+		if ((off + len) >= size) {
+			if (size < 61440)
+				rc = ENOMEM;
+			else
+				zfs_zvols_paging = paging - 1;
+			break;
+		}
+		snprintf((buf + off), len + 1, "%s", entry);
+		off += len;
+	}
+	if (zv == NULL)
+		zfs_zvols_paging = -1;
+	mutex_exit(&zvol_state_lock);
+
+	return (rc);
+}
+
+static void *
+zfs_zvols_addr(kstat_t *ksp, loff_t n)
+{
+	if (n == 0) {
+		zfs_zvols_paging = 0;
+		return ((void *)&zfs_zvols_paging);
+	}
+	else {
+		if (zfs_zvols_paging > 0)
+			return ((void *)&zfs_zvols_paging);
+		else
+			return (NULL);
+	}
+}
+
+void
+zfs_zvols_init(void)
+{
+	mutex_init(&zfs_zvols_lock, NULL, MUTEX_DEFAULT, NULL);
+
+	zfs_zvols_kstat = kstat_create("zfs", 0, "zvols", "misc",
+	    KSTAT_TYPE_RAW, 0, KSTAT_FLAG_VIRTUAL);
+	if (zfs_zvols_kstat) {
+		zfs_zvols_kstat->ks_lock = &zfs_zvols_lock;
+		zfs_zvols_kstat->ks_ndata = UINT32_MAX;
+		zfs_zvols_kstat->ks_private = NULL;
+		kstat_set_raw_ops(zfs_zvols_kstat, zfs_zvols_headers, zfs_zvols_data, zfs_zvols_addr);
+		kstat_install(zfs_zvols_kstat);
+	}
+}
+
+void
+zfs_zvols_fini(void)
+{
+	if (zfs_zvols_kstat)
+		kstat_delete(zfs_zvols_kstat);
+
+	mutex_destroy(&zfs_zvols_lock);
+}
+
 int
 zvol_init(void)
 {
@@ -2664,6 +2834,8 @@ zvol_init(void)
 	blk_register_region(MKDEV(zvol_major, 0), 1UL << MINORBITS,
 	    THIS_MODULE, zvol_probe, NULL, NULL);
 
+	zfs_zvols_init();
+
 	return (0);
 
 out_free:
@@ -2681,6 +2853,8 @@ out:
 void
 zvol_fini(void)
 {
+	zfs_zvols_fini();
+
 	zvol_remove_minors_impl(NULL);
 
 	blk_unregister_region(MKDEV(zvol_major, 0), 1UL << MINORBITS);

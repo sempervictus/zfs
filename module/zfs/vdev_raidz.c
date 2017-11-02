@@ -2106,6 +2106,16 @@ vdev_raidz_io_done(zio_t *zio)
 		if (data_errors == 0) {
 			if (raidz_checksum_verify(zio) == 0) {
 				/*
+				 * ZIL data is only read on pool import
+				 * and is then discarded. It does not make
+				 * sense to do reconstruction if the checksum
+				 * matches.
+				 */
+				blkptr_t *bp = zio->io_bp;
+				if (bp != NULL &&
+				    BP_GET_CHECKSUM(bp) == ZIO_CHECKSUM_ZILOG2)
+					goto done;
+				/*
 				 * If we read parity information (unnecessarily
 				 * as it happens since no reconstruction was
 				 * needed) regenerate and verify the parity.

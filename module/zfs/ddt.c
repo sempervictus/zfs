@@ -38,8 +38,16 @@
 #include <sys/dsl_scan.h>
 #include <sys/abd.h>
 
+typedef struct ddtse {
+	ddt_t *ddtse_ddt;
+	ddt_entry_t *ddtse_dde;
+	dmu_tx_t *ddtse_tx;
+	uint64_t ddtse_txg;
+} ddtse_t;
+
 static kmem_cache_t *ddt_cache;
 static kmem_cache_t *ddt_entry_cache;
+static kmem_cache_t *ddt_sync_entry_cache;
 
 /*
  * Enable/disable prefetching of dedup-ed blocks which are going to be freed.
@@ -681,11 +689,14 @@ ddt_init(void)
 	    sizeof (ddt_t), 0, NULL, NULL, NULL, NULL, NULL, 0);
 	ddt_entry_cache = kmem_cache_create("ddt_entry_cache",
 	    sizeof (ddt_entry_t), 0, NULL, NULL, NULL, NULL, NULL, 0);
+	ddt_sync_entry_cache = kmem_cache_create("ddt_sync_entry_cache",
+	    sizeof (ddtse_t), 0, NULL, NULL, NULL, NULL, NULL, 0);
 }
 
 void
 ddt_fini(void)
 {
+	kmem_cache_destroy(ddt_sync_entry_cache);
 	kmem_cache_destroy(ddt_entry_cache);
 	kmem_cache_destroy(ddt_cache);
 }
@@ -1081,7 +1092,7 @@ ddt_repair_table(ddt_t *ddt, zio_t *rio)
 }
 
 static void
-ddt_sync_entry(ddt_t *ddt, ddt_entry_t *dde, dmu_tx_t *tx, uint64_t txg)
+ddt_sync_entry_impl(ddt_t *ddt, ddt_entry_t *dde, dmu_tx_t *tx, uint64_t txg)
 {
 	dsl_pool_t *dp = ddt->ddt_spa->spa_dsl_pool;
 	ddt_phys_t *ddp = dde->dde_phys;
@@ -1129,8 +1140,10 @@ ddt_sync_entry(ddt_t *ddt, ddt_entry_t *dde, dmu_tx_t *tx, uint64_t txg)
 		dde->dde_type = ntype;
 		dde->dde_class = nclass;
 		ddt_stat_update(ddt, dde, 0);
+		ddt_enter(ddt);
 		if (!ddt_object_exists(ddt, ntype, nclass))
 			ddt_object_create(ddt, ntype, nclass, tx);
+		ddt_exit(ddt);
 		VERIFY(ddt_object_update(ddt, ntype, nclass, dde, tx) == 0);
 
 		/*
@@ -1148,6 +1161,18 @@ ddt_sync_entry(ddt_t *ddt, ddt_entry_t *dde, dmu_tx_t *tx, uint64_t txg)
 }
 
 static void
+ddt_sync_entry(void *arg)
+{
+	ddtse_t *ddtse = arg;
+
+	ddt_sync_entry_impl(ddtse->ddtse_ddt, ddtse->ddtse_dde, ddtse->ddtse_tx,
+	    ddtse->ddtse_txg);
+
+	ddt_free(ddtse->ddtse_dde);
+	kmem_cache_free(ddt_sync_entry_cache, ddtse);
+}
+
+static void
 ddt_sync_table(ddt_t *ddt, dmu_tx_t *tx, uint64_t txg)
 {
 	spa_t *spa = ddt->ddt_spa;
@@ -1155,6 +1180,7 @@ ddt_sync_table(ddt_t *ddt, dmu_tx_t *tx, uint64_t txg)
 	void *cookie = NULL;
 	enum ddt_type type;
 	enum ddt_class class;
+	taskq_t *tq;
 
 	if (avl_numnodes(&ddt->ddt_tree) == 0)
 		return;
@@ -1167,10 +1193,21 @@ ddt_sync_table(ddt_t *ddt, dmu_tx_t *tx, uint64_t txg)
 		    DMU_POOL_DDT_STATS, tx);
 	}
 
+	tq = taskq_create("ddt_sync_entry", boot_ncpus, maxclsyspri, boot_ncpus, INT_MAX, 0);
+
 	while ((dde = avl_destroy_nodes(&ddt->ddt_tree, &cookie)) != NULL) {
-		ddt_sync_entry(ddt, dde, tx, txg);
-		ddt_free(dde);
+		ddtse_t *ddtse = kmem_cache_alloc(ddt_sync_entry_cache, KM_SLEEP);
+
+		ddtse->ddtse_ddt = ddt;
+		ddtse->ddtse_dde = dde;
+		ddtse->ddtse_tx = tx;
+		ddtse->ddtse_txg = txg;
+
+		taskq_dispatch(tq, &ddt_sync_entry, ddtse, TQ_SLEEP);
 	}
+
+	taskq_wait(tq);
+	taskq_destroy(tq);
 
 	for (type = 0; type < DDT_TYPES; type++) {
 		uint64_t add, count = 0;

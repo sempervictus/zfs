@@ -116,6 +116,7 @@ AC_CONFIG_FILES([
 	cmd/zgenhostid/Makefile
 	contrib/Makefile
 	contrib/bash_completion.d/Makefile
+	cmd/zstream_split/Makefile
 	contrib/dracut/Makefile
 	contrib/dracut/02zfsexpandknowledge/Makefile
 	contrib/dracut/90zfs/Makefile

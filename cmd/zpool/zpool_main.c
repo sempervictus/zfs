@@ -291,15 +291,15 @@ get_usage(zpool_help_t idx)
 {
 	switch (idx) {
 	case HELP_ADD:
-		return (gettext("\tadd [-fgLnP] [-o property=value] "
+		return (gettext("\tadd [-fgLnPD] [-o property=value] "
 		    "<pool> <vdev> ...\n"));
 	case HELP_ATTACH:
-		return (gettext("\tattach [-f] [-o property=value] "
+		return (gettext("\tattach [-fD] [-o property=value] "
 		    "<pool> <device> <new-device>\n"));
 	case HELP_CLEAR:
 		return (gettext("\tclear [-nF] <pool> [device]\n"));
 	case HELP_CREATE:
-		return (gettext("\tcreate [-fnd] [-o property=value] ... \n"
+		return (gettext("\tcreate [-fndD] [-o property=value] ... \n"
 		    "\t    [-O file-system-property=value] ... \n"
 		    "\t    [-m mountpoint] [-R root] <pool> <vdev> ...\n"));
 	case HELP_DESTROY:
@@ -335,7 +335,7 @@ get_usage(zpool_help_t idx)
 	case HELP_ONLINE:
 		return (gettext("\tonline <pool> <device> ...\n"));
 	case HELP_REPLACE:
-		return (gettext("\treplace [-f] [-o property=value] "
+		return (gettext("\treplace [-fD] [-o property=value] "
 		    "<pool> <device> [new-device]\n"));
 	case HELP_REMOVE:
 		return (gettext("\tremove <pool> <device> ...\n"));
@@ -358,7 +358,7 @@ get_usage(zpool_help_t idx)
 	case HELP_SET:
 		return (gettext("\tset <property=value> <pool> \n"));
 	case HELP_SPLIT:
-		return (gettext("\tsplit [-gLnP] [-R altroot] [-o mntopts]\n"
+		return (gettext("\tsplit [-gLnPD] [-R altroot] [-o mntopts]\n"
 		    "\t    [-o property=value] <pool> <newpool> "
 		    "[<device> ...]\n"));
 	case HELP_REGUID:
@@ -590,13 +590,14 @@ add_prop_list_default(const char *propname, char *propval, nvlist_t **props,
 }
 
 /*
- * zpool add [-fgLnP] [-o property=value] <pool> <vdev> ...
+ * zpool add [-fgLnPD] [-o property=value] <pool> <vdev> ...
  *
  *	-f	Force addition of devices, even if they appear in use
  *	-g	Display guid for individual vdev name.
  *	-L	Follow links when resolving vdev path name.
  *	-n	Do not add the devices, but display the resulting layout if
  *		they were to be added.
+ *	-D	Automatically partition the device(s).
  *	-o	Set property=value.
  *	-P	Display full path for vdev name.
  *
@@ -610,6 +611,7 @@ zpool_do_add(int argc, char **argv)
 	boolean_t force = B_FALSE;
 	boolean_t dryrun = B_FALSE;
 	int name_flags = 0;
+	boolean_t auto_partition_device = B_FALSE;
 	int c;
 	nvlist_t *nvroot;
 	char *poolname;
@@ -620,7 +622,7 @@ zpool_do_add(int argc, char **argv)
 	char *propval;
 
 	/* check options */
-	while ((c = getopt(argc, argv, "fgLno:P")) != -1) {
+	while ((c = getopt(argc, argv, "fgLno:PD")) != -1) {
 		switch (c) {
 		case 'f':
 			force = B_TRUE;
@@ -633,6 +635,9 @@ zpool_do_add(int argc, char **argv)
 			break;
 		case 'n':
 			dryrun = B_TRUE;
+			break;
+		case 'D':
+			auto_partition_device = B_TRUE;
 			break;
 		case 'o':
 			if ((propval = strchr(optarg, '=')) == NULL) {
@@ -701,7 +706,7 @@ zpool_do_add(int argc, char **argv)
 
 	/* pass off to get_vdev_spec for processing */
 	nvroot = make_root_vdev(zhp, props, force, !force, B_FALSE, dryrun,
-	    argc, argv);
+	    auto_partition_device, argc, argv);
 	if (nvroot == NULL) {
 		zpool_close(zhp);
 		return (1);
@@ -961,7 +966,7 @@ errout:
 }
 
 /*
- * zpool create [-fnd] [-o property=value] ...
+ * zpool create [-fndD] [-o property=value] ...
  *		[-O file-system-property=value] ...
  *		[-R root] [-m mountpoint] <pool> <dev> ...
  *
@@ -975,6 +980,7 @@ errout:
  *	-o	Set feature@feature=enabled|disabled.
  *	-d	Don't automatically enable all supported pool features
  *		(individual features can be enabled with -o).
+ *	-D	Don't automatically partition the device(s).
  *	-O	Set fsproperty=value in the pool's root file system
  *
  * Creates the named pool according to the given vdev specification.  The
@@ -988,6 +994,7 @@ zpool_do_create(int argc, char **argv)
 	boolean_t force = B_FALSE;
 	boolean_t dryrun = B_FALSE;
 	boolean_t enable_all_pool_feat = B_TRUE;
+	boolean_t auto_partition_device = B_FALSE;
 	int c;
 	nvlist_t *nvroot = NULL;
 	char *poolname;
@@ -1000,7 +1007,7 @@ zpool_do_create(int argc, char **argv)
 	char *propval;
 
 	/* check options */
-	while ((c = getopt(argc, argv, ":fndR:m:o:O:t:")) != -1) {
+	while ((c = getopt(argc, argv, ":fndDR:m:o:O:t:")) != -1) {
 		switch (c) {
 		case 'f':
 			force = B_TRUE;
@@ -1010,6 +1017,9 @@ zpool_do_create(int argc, char **argv)
 			break;
 		case 'd':
 			enable_all_pool_feat = B_FALSE;
+			break;
+		case 'D':
+			auto_partition_device = B_TRUE;
 			break;
 		case 'R':
 			altroot = optarg;
@@ -1136,7 +1146,7 @@ zpool_do_create(int argc, char **argv)
 
 	/* pass off to get_vdev_spec for bulk processing */
 	nvroot = make_root_vdev(NULL, props, force, !force, B_FALSE, dryrun,
-	    argc - 1, argv + 1);
+	    auto_partition_device, argc - 1, argv + 1);
 	if (nvroot == NULL)
 		goto errout;
 
@@ -5159,6 +5169,7 @@ static int
 zpool_do_attach_or_replace(int argc, char **argv, int replacing)
 {
 	boolean_t force = B_FALSE;
+	boolean_t auto_partition_device = B_FALSE;
 	int c;
 	nvlist_t *nvroot;
 	char *poolname, *old_disk, *new_disk;
@@ -5168,10 +5179,13 @@ zpool_do_attach_or_replace(int argc, char **argv, int replacing)
 	int ret;
 
 	/* check options */
-	while ((c = getopt(argc, argv, "fo:")) != -1) {
+	while ((c = getopt(argc, argv, "fDo:")) != -1) {
 		switch (c) {
 		case 'f':
 			force = B_TRUE;
+			break;
+		case 'D':
+			auto_partition_device = B_TRUE;
 			break;
 		case 'o':
 			if ((propval = strchr(optarg, '=')) == NULL) {
@@ -5260,7 +5274,7 @@ zpool_do_attach_or_replace(int argc, char **argv, int replacing)
 	}
 
 	nvroot = make_root_vdev(zhp, props, force, B_FALSE, replacing, B_FALSE,
-	    argc, argv);
+	    auto_partition_device, argc, argv);
 	if (nvroot == NULL) {
 		zpool_close(zhp);
 		nvlist_free(props);
@@ -5377,6 +5391,7 @@ zpool_do_detach(int argc, char **argv)
  *	-o	Set property=value, or set mount options.
  *	-P	Display full path for vdev name.
  *	-R	Mount the split-off pool under an alternate root.
+ *	-D	Don't automatically partition the device(s).
  *
  * Splits the named pool and gives it the new pool name.  Devices to be split
  * off may be listed, provided that no more than one device is specified
@@ -5396,13 +5411,14 @@ zpool_do_split(int argc, char **argv)
 	int c, ret = 0;
 	zpool_handle_t *zhp;
 	nvlist_t *config, *props = NULL;
+	boolean_t auto_partition_device = B_FALSE;
 
 	flags.dryrun = B_FALSE;
 	flags.import = B_FALSE;
 	flags.name_flags = 0;
 
 	/* check options */
-	while ((c = getopt(argc, argv, ":gLR:no:P")) != -1) {
+	while ((c = getopt(argc, argv, ":gLR:no:PD")) != -1) {
 		switch (c) {
 		case 'g':
 			flags.name_flags |= VDEV_NAME_GUID;
@@ -5421,6 +5437,9 @@ zpool_do_split(int argc, char **argv)
 			break;
 		case 'n':
 			flags.dryrun = B_TRUE;
+			break;
+		case 'D':
+			auto_partition_device = B_TRUE;
 			break;
 		case 'o':
 			if ((propval = strchr(optarg, '=')) != NULL) {
@@ -5480,7 +5499,8 @@ zpool_do_split(int argc, char **argv)
 		return (1);
 	}
 
-	config = split_mirror_vdev(zhp, newpool, props, flags, argc, argv);
+	config = split_mirror_vdev(zhp, newpool, props, flags,
+	    auto_partition_device, argc, argv);
 	if (config == NULL) {
 		ret = 1;
 	} else {

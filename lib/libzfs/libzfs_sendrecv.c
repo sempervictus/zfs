@@ -742,6 +742,8 @@ send_iterate_prop(zfs_handle_t *zhp, nvlist_t *nv)
 			    ZPROP_VALUE, &value) == 0);
 			if (zhp->zfs_type == ZFS_TYPE_SNAPSHOT)
 				continue;
+			if (prop == ZFS_PROP_REFRESERVATION)
+				continue;
 			/*
 			 * May have no source before SPA_VERSION_RECVD_PROPS,
 			 * but is still modifiable.
