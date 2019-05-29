@@ -26,6 +26,7 @@ $(MODULE)-objs += cityhash.o
 $(MODULE)-objs += dbuf.o
 $(MODULE)-objs += dbuf_stats.o
 $(MODULE)-objs += bptree.o
+$(MODULE)-objs += btree.o
 $(MODULE)-objs += bqueue.o
 $(MODULE)-objs += dataset_kstats.o
 $(MODULE)-objs += ddt.o
